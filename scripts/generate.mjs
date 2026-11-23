@@ -7,7 +7,8 @@ import path from 'node:path';
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 const ARTICLES = path.join(ROOT, 'docs', 'articles.json');
 const SPARES = path.join(ROOT, 'yobi.json');
-const EVENTS = path.join(ROOT, 'tokubetsu.json'); // 特別な日（夜旅さんが自由に足せる）
+const EVENTS = path.join(ROOT, 'tokubetsu.json');
+const WAITING = path.join(ROOT, 'midashi_machi.json'); // 本文を書けなかった見出し（次に使う） // 特別な日（夜旅さんが自由に足せる）
 
 const SLOTS = ['07:00', '12:00', '15:00', '18:00', '21:00'];
 const KEEP_DAYS = 30;
@@ -177,16 +178,27 @@ function checkPrompt(a) {
 次のJSONだけを返す：{"ok": true または false, "reason": "falseのときの理由（短く）"}`;
 }
 
+let waiting = [];
+
 async function makeOne(recent, ev) {
   for (let attempt = 1; attempt <= 2; attempt++) { // やり直しは1回まで
-    // 1. 見出し（OpenAI）
-    const h = await callOpenAI(headlinePrompt(recent, ev));
-    if (!h || typeof h.headline !== 'string' || !h.headline.trim() || h.headline.length > 40) { log(`  見出しの形がおかしいので不採用（${attempt}回目）`); continue; }
-    h.headline = h.headline.trim();
-    if (!CATEGORIES.includes(h.category)) h.category = '社会';
-    if (NG.test(h.headline)) { log(`  見出しに禁止語（${attempt}回目）: ${h.headline}`); continue; }
-    // 2. 本文（Gemini）
-    const b = await callGemini(bodyPrompt(h, ev));
+    // 1. 見出し（OpenAI）。前回本文を書けなかった見出しがあれば、そちらを先に使う（特別な日は除く）
+    let h = !ev && waiting.length ? waiting.shift() : null;
+    if (h) log(`  待っていた見出しを使う: ${h.headline}`);
+    else {
+      h = await callOpenAI(headlinePrompt(recent, ev));
+      if (!h || typeof h.headline !== 'string' || !h.headline.trim() || h.headline.length > 40) { log(`  見出しの形がおかしいので不採用（${attempt}回目）`); continue; }
+      h.headline = h.headline.trim();
+      if (!CATEGORIES.includes(h.category)) h.category = '社会';
+      if (NG.test(h.headline)) { log(`  見出しに禁止語（${attempt}回目）: ${h.headline}`); continue; }
+    }
+    // 2. 本文（Gemini）。Geminiが混んでいて書けなければ、見出しはとっておいて次に回す
+    let b;
+    try { b = await callGemini(bodyPrompt(h, ev)); }
+    catch (e) {
+      if (!ev) { waiting.push({ category: h.category, headline: h.headline }); log(`  見出しをとっておきます: ${h.headline}`); }
+      throw e;
+    }
     const body = typeof b?.body === 'string' ? b.body.trim() : '';
     if (body.length < 100 || body.length > 900) { log(`  本文の形がおかしいので不採用（${attempt}回目）: ${h.headline}`); continue; }
     if (NG.test(body)) { log(`  本文に禁止語（${attempt}回目）: ${h.headline}`); continue; }
@@ -216,6 +228,7 @@ async function main() {
   const spares = readJson(SPARES, { spares: [] });
   const have = new Set(store.articles.map(a => a.id));
   const events = readJson(EVENTS, {});
+  waiting = readJson(WAITING, { midashi: [] }).midashi;
 
   // 作る枠を決める（今日の残りと明日。過去の枠は作らない）
   const today = jstDate(NOW);
@@ -230,7 +243,7 @@ async function main() {
   log(`作る枠: ${need.length}本 ${need.map(n => n.id).join(', ') || '（なし）'}`);
 
   const recent = store.articles.slice(-40).map(a => a.headline);
-  let added = 0, usedSpare = 0, empty = 0;
+  let added = 0, usedSpare = 0, empty = 0, stopped = false;
 
   for (const n of need) {
     if (have.has(n.id)) continue; // 念のため送る直前にもう一度確かめる
@@ -238,9 +251,10 @@ async function main() {
     let a = null;
     const ev = EVENT_SLOTS.includes(n.slot) ? events[n.date.slice(5)] : null;
     if (ev) log(`  特別な日: ${ev}`);
-    try { a = await makeOne(recent, ev); } catch (e) { log('  ' + e.message); if (calls >= MAX_CALLS) break; }
+    let geminiDown = false;
+    try { a = await makeOne(recent, ev); } catch (e) { log('  ' + e.message); geminiDown = true; }
     if (!a && spares.spares.length) { a = spares.spares.shift(); usedSpare++; log('  予備記事を使いました'); }
-    if (!a) { empty++; log('  この枠は空きのままです'); continue; }
+    if (!a) { empty++; log('  この枠は空きのままです'); if (geminiDown) { stopped = true; break; } continue; }
     const art = { id: n.id, publishAt: `${n.date}T${n.slot}:00+09:00`, category: a.category, headline: a.headline, body: a.body };
     store.articles.push(art);
     have.add(n.id);
@@ -250,7 +264,7 @@ async function main() {
   }
 
   // 予備記事を補充（試しの実行では作らない）
-  if (LIMIT === 0) {
+  if (LIMIT === 0 && !stopped) {
     while (spares.spares.length < SPARE_TARGET && calls + 6 <= MAX_CALLS) {
       log('[予備]');
       const a = await makeOne(recent).catch(e => { log('  ' + e.message); return null; });
@@ -269,6 +283,7 @@ async function main() {
 
   fs.writeFileSync(ARTICLES, JSON.stringify(store, null, 1) + '\n');
   fs.writeFileSync(SPARES, JSON.stringify(spares, null, 1) + '\n');
+  fs.writeFileSync(WAITING, JSON.stringify({ midashi: waiting.slice(-10) }, null, 1) + '\n');
 
   const costOf = w => (use[w].in * PRICE[w].in + use[w].out * PRICE[w].out) / 1e6;
   const summary = [
@@ -276,6 +291,8 @@ async function main() {
     `- 新しく入れた記事: ${added}本（うち予備記事 ${usedSpare}本）`,
     `- 空きのままの枠: ${empty}本`,
     `- 予備記事の残り: ${spares.spares.length}本`,
+    `- 本文待ちの見出し: ${waiting.length}本`,
+    ...(stopped ? ['- AIが呼べなかったので、残りの枠は作らずに止めました（次の実行で作ります）'] : []),
     `- AIの呼び出し: ${calls}回（上限 ${MAX_CALLS}回）`,
     `- 見出し OpenAI（${OPENAI_MODEL}）: ${use.openai.calls}回、入力 ${use.openai.in} / 出力 ${use.openai.out} トークン、目安 $${costOf('openai').toFixed(4)}`,
     `- 本文とチェック Gemini（${GEMINI_MODEL}）: ${use.gemini.calls}回、入力 ${use.gemini.in} / 出力 ${use.gemini.out} トークン、目安 $${costOf('gemini').toFixed(4)}`,
