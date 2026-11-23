@@ -15,7 +15,7 @@ const SPARE_TARGET = 3;
 const EVENT_SLOTS = ['07:00', '18:00']; // 特別な日は、この2本をその日にちなんだ記事にする
 
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
 const OPENAI_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5-mini';
 const DRY_RUN = process.env.DRY_RUN === '1';
@@ -23,7 +23,7 @@ const LIMIT = Number(process.env.LIMIT || 0);          // 試しに少しだけ�
 const MAX_CALLS = Number(process.env.MAX_CALLS || 40); // 1回の実行で呼べる上限（2社の合計）
 // 100万トークンあたりのドル（目安の料金の計算用）
 const PRICE = {
-  gemini: { in: Number(process.env.GEMINI_IN_PRICE || 0.30), out: Number(process.env.GEMINI_OUT_PRICE || 2.50) },
+  gemini: { in: Number(process.env.GEMINI_IN_PRICE || 0.75), out: Number(process.env.GEMINI_OUT_PRICE || 3.75) },
   openai: { in: Number(process.env.OPENAI_IN_PRICE || 0.25), out: Number(process.env.OPENAI_OUT_PRICE || 2.00) },
 };
 const NOW = process.env.NOW ? new Date(process.env.NOW) : new Date();
@@ -199,9 +199,18 @@ async function makeOne(recent, ev) {
   return null;
 }
 
+// お金のかからない確認：使うモデルが本当に使えるかを、記事を書かせる前に確かめる
+async function preflight() {
+  const g = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}`, { headers: { 'x-goog-api-key': GEMINI_KEY } });
+  if (!g.ok) throw new Error(`Geminiのモデル ${GEMINI_MODEL} が使えません（${g.status}）。何も書かせずに止めました`);
+  const o = await fetch(`https://api.openai.com/v1/models/${OPENAI_MODEL}`, { headers: { authorization: `Bearer ${OPENAI_KEY}` } });
+  if (!o.ok) throw new Error(`OpenAIのモデル ${OPENAI_MODEL} が使えません（${o.status}）。何も書かせずに止めました`);
+}
+
 async function main() {
   if (!DRY_RUN && !GEMINI_KEY) throw new Error('GEMINI_API_KEY が設定されていません');
   if (!DRY_RUN && !OPENAI_KEY) throw new Error('OPENAI_API_KEY が設定されていません');
+  if (!DRY_RUN) await preflight();
 
   const store = readJson(ARTICLES, { articles: [] });
   const spares = readJson(SPARES, { spares: [] });
