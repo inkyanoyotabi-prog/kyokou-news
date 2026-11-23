@@ -43,6 +43,23 @@ function jstDate(d) {
 }
 function slotTime(date, hhmm) { return new Date(`${date}T${hhmm}:00+09:00`); }
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const RETRY_STATUS = [429, 500, 502, 503, 504];
+const RETRY_WAIT = Number(process.env.RETRY_WAIT || 30000);
+
+// 混み合い（503など）のときは、少し待ってからもう1回だけ呼ぶ
+async function post(who, url, headers, body) {
+  for (let i = 1; i <= 2; i++) {
+    countCall(who);
+    const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) return data;
+    const msg = `${who}の呼び出しに失敗: ${res.status} ${JSON.stringify(data).slice(0, 200)}`;
+    if (i === 1 && RETRY_STATUS.includes(res.status)) { log('  ' + msg + ' → 少し待ってもう1回'); await sleep(RETRY_WAIT); continue; }
+    throw new Error(msg);
+  }
+}
+
 function countCall(who) {
   if (calls >= MAX_CALLS) throw new Error(`呼び出し上限（${MAX_CALLS}回）に達したので止めました`);
   calls++; use[who].calls++;
@@ -50,19 +67,15 @@ function countCall(who) {
 
 // 見出し係（OpenAI）
 async function callOpenAI(prompt) {
-  countCall('openai');
-  if (DRY_RUN) return fakeAI('openai', prompt);
-  const res = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${OPENAI_KEY}` },
-    body: JSON.stringify({
+  if (DRY_RUN) { countCall('openai'); return fakeAI('openai', prompt); }
+  const data = await post('openai', 'https://api.openai.com/v1/chat/completions',
+    { 'content-type': 'application/json', authorization: `Bearer ${OPENAI_KEY}` },
+    {
       model: OPENAI_MODEL,
       messages: [{ role: 'user', content: prompt }],
       response_format: { type: 'json_object' },
-    }),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(`OpenAIの呼び出しに失敗: ${res.status} ${JSON.stringify(data).slice(0, 300)}`);
+      reasoning_effort: process.env.OPENAI_REASONING || 'low', // 見出しは短いので考えすぎさせない（料金のため）
+    });
   use.openai.in += data.usage?.prompt_tokens || 0;
   use.openai.out += data.usage?.completion_tokens || 0;
   return JSON.parse(data.choices?.[0]?.message?.content || '{}');
@@ -70,19 +83,13 @@ async function callOpenAI(prompt) {
 
 // 本文係・チェック係（Gemini）
 async function callGemini(prompt) {
-  countCall('gemini');
-  if (DRY_RUN) return fakeAI('gemini', prompt);
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-goog-api-key': GEMINI_KEY },
-    body: JSON.stringify({
+  if (DRY_RUN) { countCall('gemini'); return fakeAI('gemini', prompt); }
+  const data = await post('gemini', `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+    { 'content-type': 'application/json', 'x-goog-api-key': GEMINI_KEY },
+    {
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       generationConfig: { responseMimeType: 'application/json', temperature: 1.0 },
-    }),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(`Geminiの呼び出しに失敗: ${res.status} ${JSON.stringify(data).slice(0, 300)}`);
+    });
   const u = data.usageMetadata || {};
   use.gemini.in += u.promptTokenCount || 0;
   use.gemini.out += (u.candidatesTokenCount || 0) + (u.thoughtsTokenCount || 0);
