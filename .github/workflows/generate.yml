@@ -39,6 +39,6 @@ jobs:
         run: |
           git config user.name "kyokou-bot"
           git config user.email "kyokou-bot@users.noreply.github.com"
-          git add docs/articles.json yobi.json midashi_machi.json
+          git add -A docs yobi.json
           git diff --cached --quiet || git commit -m "記事を追加"
           git push
