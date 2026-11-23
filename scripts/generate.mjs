@@ -7,13 +7,15 @@ import path from 'node:path';
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 const ARTICLES = path.join(ROOT, 'docs', 'articles.json');
 const SPARES = path.join(ROOT, 'yobi.json');
+const EVENTS = path.join(ROOT, 'tokubetsu.json'); // 特別な日（夜旅さんが自由に足せる）
 
 const SLOTS = ['07:00', '12:00', '15:00', '18:00', '21:00'];
 const KEEP_DAYS = 30;
 const SPARE_TARGET = 3;
+const EVENT_SLOTS = ['07:00', '18:00']; // 特別な日は、この2本をその日にちなんだ記事にする
 
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const OPENAI_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5-mini';
 const DRY_RUN = process.env.DRY_RUN === '1';
@@ -116,9 +118,13 @@ const RULES = `## 絶対に守ること
 - 次の話題は書かない：選挙・政党・政治家、災害、事故、死亡、病気、犯罪・逮捕、戦争・テロ、宗教、民族・国籍・性別・障害などへの差別や揶揄、性的な内容、実在の報道機関のまね。
 - 特定の誰かを傷つけたり、本当のニュースと勘違いされたりする内容にしない。`;
 
-function headlinePrompt(recent) {
-  return `あなたは架空のニュースサイトのデスクです。日本語の「虚構ニュース」の見出しを1本考えてください。
+function eventNote(ev) {
+  return ev ? `\n## 今日は「${ev}」\nこの日にちなんだ、くだらない話題にする。行事の楽しい面だけを扱い、宗教や歴史上の悲しい出来事には触れない。\n` : '';
+}
 
+function headlinePrompt(recent, ev) {
+  return `あなたは架空のニュースサイトのデスクです。日本語の「虚構ニュース」の見出しを1本考えてください。
+${eventNote(ev)}
 ## 見出しの書き方
 - 本物の新聞の見出しのような、まじめで簡潔な言い回し。内容はばかばかしく、見出しだけで笑えるもの。
 - 28文字以内。
@@ -133,12 +139,12 @@ ${recent.map(h => '- ' + h).join('\n') || '- （まだなし）'}
 {"category": "${CATEGORIES.join('|')}のどれか", "headline": "見出し"}`;
 }
 
-function bodyPrompt(h) {
+function bodyPrompt(h, ev) {
   return `あなたは架空のニュースサイトの記者です。次の見出しの「虚構ニュース」の本文を書いてください。
 
 見出し：${h.headline}
 分野：${h.category}
-
+${eventNote(ev)}
 ## 本文の書き方
 - 本物の新聞のような、まじめで落ち着いた文体。見出しの内容を、もっともらしい細部でふくらませて笑わせる。
 - 250〜450文字。3〜4段落。段落の間は空行（\\n\\n）。
@@ -162,6 +168,7 @@ function checkPrompt(a) {
 3. 本物のニュースと勘違いされるような、もっともらしい嘘になっていない（ばかばかしさで冗談だとわかる）。
 4. 誰かを傷つける・揶揄する内容ではない。
 5. 本文が見出しの内容に合っている。
+（七夕・クリスマスなどの年中行事を楽しい話題として扱うのは問題ない）
 
 記事：
 見出し：${a.headline}
@@ -170,16 +177,16 @@ function checkPrompt(a) {
 次のJSONだけを返す：{"ok": true または false, "reason": "falseのときの理由（短く）"}`;
 }
 
-async function makeOne(recent) {
+async function makeOne(recent, ev) {
   for (let attempt = 1; attempt <= 2; attempt++) { // やり直しは1回まで
     // 1. 見出し（OpenAI）
-    const h = await callOpenAI(headlinePrompt(recent));
+    const h = await callOpenAI(headlinePrompt(recent, ev));
     if (!h || typeof h.headline !== 'string' || !h.headline.trim() || h.headline.length > 40) { log(`  見出しの形がおかしいので不採用（${attempt}回目）`); continue; }
     h.headline = h.headline.trim();
     if (!CATEGORIES.includes(h.category)) h.category = '社会';
     if (NG.test(h.headline)) { log(`  見出しに禁止語（${attempt}回目）: ${h.headline}`); continue; }
     // 2. 本文（Gemini）
-    const b = await callGemini(bodyPrompt(h));
+    const b = await callGemini(bodyPrompt(h, ev));
     const body = typeof b?.body === 'string' ? b.body.trim() : '';
     if (body.length < 100 || body.length > 900) { log(`  本文の形がおかしいので不採用（${attempt}回目）: ${h.headline}`); continue; }
     if (NG.test(body)) { log(`  本文に禁止語（${attempt}回目）: ${h.headline}`); continue; }
@@ -199,6 +206,7 @@ async function main() {
   const store = readJson(ARTICLES, { articles: [] });
   const spares = readJson(SPARES, { spares: [] });
   const have = new Set(store.articles.map(a => a.id));
+  const events = readJson(EVENTS, {});
 
   // 作る枠を決める（今日の残りと明日。過去の枠は作らない）
   const today = jstDate(NOW);
@@ -219,7 +227,9 @@ async function main() {
     if (have.has(n.id)) continue; // 念のため送る直前にもう一度確かめる
     log(`[${n.id}]`);
     let a = null;
-    try { a = await makeOne(recent); } catch (e) { log('  ' + e.message); if (calls >= MAX_CALLS) break; }
+    const ev = EVENT_SLOTS.includes(n.slot) ? events[n.date.slice(5)] : null;
+    if (ev) log(`  特別な日: ${ev}`);
+    try { a = await makeOne(recent, ev); } catch (e) { log('  ' + e.message); if (calls >= MAX_CALLS) break; }
     if (!a && spares.spares.length) { a = spares.spares.shift(); usedSpare++; log('  予備記事を使いました'); }
     if (!a) { empty++; log('  この枠は空きのままです'); continue; }
     const art = { id: n.id, publishAt: `${n.date}T${n.slot}:00+09:00`, category: a.category, headline: a.headline, body: a.body };
